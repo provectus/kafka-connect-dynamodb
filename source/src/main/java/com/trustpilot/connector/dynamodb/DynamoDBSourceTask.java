@@ -86,6 +86,7 @@ public class DynamoDBSourceTask extends SourceTask {
     private SourceInfo sourceInfo;
     private TableDescription tableDesc;
     private int initSyncDelay;
+    private boolean skipInitialDataInTable = false;
 
     @SuppressWarnings("unused")
     //Used by Confluent platform to initialize connector
@@ -111,7 +112,8 @@ public class DynamoDBSourceTask extends SourceTask {
 
         LOGGER.debug("Getting DynamoDB description for table: {}", config.getTableName());
         if (client == null) {
-            client = AwsClients.buildDynamoDbClient(config.getAwsRegion(),
+            client = AwsClients.buildDynamoDbClient(config.getAwsEndpoint(),
+                                                    config.getAwsRegion(),
                                                     config.getAwsAccessKeyId(),
                                                     config.getAwsSecretKey());
         }
@@ -138,9 +140,10 @@ public class DynamoDBSourceTask extends SourceTask {
                     eventsQueue,
                     shardRegister);
         }
-        kclWorker.start(config.getAwsRegion(), tableDesc.getTableName(), config.getTaskID());
+        kclWorker.start(config.getAwsEndpoint(), config.getAwsRegion(), tableDesc.getTableName(), config.getTaskID());
 
         shutdown = false;
+        skipInitialDataInTable = !DynamoDBSourceConnectorConfig.SRC_DYNAMODB_TABLE_SKIP_DATA_DEFAULT.equals(config.getSkipInitialDataInTable());
     }
 
     private void setStateFromOffset() {
@@ -217,42 +220,46 @@ public class DynamoDBSourceTask extends SourceTask {
         ScanResult scanResult = tableScanner.getItems(sourceInfo.exclusiveStartKey);
 
         LinkedList<SourceRecord> result = new LinkedList<>();
-        Map<String, AttributeValue> lastRecord = null;
-        for (Map<String, AttributeValue> record : scanResult.getItems()) {
-            lastRecord = record;
-            sourceInfo.initSyncCount = sourceInfo.initSyncCount + 1;
-            result.add(converter.toSourceRecord(sourceInfo,
-                                                Envelope.Operation.READ,
-                                                record,
-                                                sourceInfo.lastInitSyncStart,
-                                                null,
-                                                null));
-        }
+        if (!skipInitialDataInTable) {
+            Map<String, AttributeValue> lastRecord = null;
+            for (Map<String, AttributeValue> record : scanResult.getItems()) {
+                lastRecord = record;
+                sourceInfo.initSyncCount = sourceInfo.initSyncCount + 1;
+                result.add(converter.toSourceRecord(sourceInfo,
+                        Envelope.Operation.READ,
+                        record,
+                        sourceInfo.lastInitSyncStart,
+                        null,
+                        null));
+            }
 
-        // Only update exclusiveStartKey and init sync state on last record.
-        // Otherwise we could loose some data in case of a crash when not all records from this batch are committed.
-        sourceInfo.exclusiveStartKey = scanResult.getLastEvaluatedKey();
-        if (sourceInfo.exclusiveStartKey == null) {
-            sourceInfo.endInitSync();
-        }
+            // Only update exclusiveStartKey and init sync state on last record.
+            // Otherwise we could loose some data in case of a crash when not all records from this batch are committed.
+            sourceInfo.exclusiveStartKey = scanResult.getLastEvaluatedKey();
+            if (sourceInfo.exclusiveStartKey == null) {
+                sourceInfo.endInitSync();
+            }
 
-        // Add last record with updated state info
-        if (!result.isEmpty()) {
-            result.removeLast();
-            result.add(converter.toSourceRecord(sourceInfo,
-                                                Envelope.Operation.READ,
-                                                lastRecord,
-                                                sourceInfo.lastInitSyncStart,
-                                                null,
-                                                null));
-        }
+            // Add last record with updated state info
+            if (!result.isEmpty()) {
+                result.removeLast();
+                result.add(converter.toSourceRecord(sourceInfo,
+                        Envelope.Operation.READ,
+                        lastRecord,
+                        sourceInfo.lastInitSyncStart,
+                        null,
+                        null));
+            }
 
 
-        if (sourceInfo.initSyncStatus == InitSyncStatus.RUNNING) {
-            LOGGER.info(
-                    "INIT_SYNC iteration returned {}. Status: {}", result.size(), sourceInfo);
+            if (sourceInfo.initSyncStatus == InitSyncStatus.RUNNING) {
+                LOGGER.info(
+                        "INIT_SYNC iteration returned {}. Status: {}", result.size(), sourceInfo);
+            } else {
+                LOGGER.info("INIT_SYNC FINISHED: {}", sourceInfo);
+            }
         } else {
-            LOGGER.info("INIT_SYNC FINISHED: {}", sourceInfo);
+            sourceInfo.endInitSync();
         }
         return result;
     }
@@ -327,24 +334,24 @@ public class DynamoDBSourceTask extends SourceTask {
                 if (dynamoDbRecord.getDynamodb().getNewImage() != null) {
                     attributes = dynamoDbRecord.getDynamodb().getNewImage();
                 } else {
-                    attributes = dynamoDbRecord.getDynamodb().getKeys();
+                    attributes = dynamoDbRecord.getDynamodb().getOldImage();
                 }
 
                 SourceRecord sourceRecord = converter.toSourceRecord(sourceInfo,
-                                                                     op,
-                                                                     attributes,
-                                                                     arrivalTimestamp.toInstant(),
-                                                                     dynamoDBRecords.getShardId(),
-                                                                     record.getSequenceNumber());
+                        op,
+                        attributes,
+                        arrivalTimestamp.toInstant(),
+                        dynamoDBRecords.getShardId(),
+                        record.getSequenceNumber());
                 result.add(sourceRecord);
 
                 if (op == Envelope.Operation.DELETE) {
                     // send a tombstone event (null value) for the old key so it can be removed from the Kafka log eventually...
                     SourceRecord tombstoneRecord = new SourceRecord(sourceRecord.sourcePartition(),
-                                                                    sourceRecord.sourceOffset(),
-                                                                    sourceRecord.topic(),
-                                                                    sourceRecord.keySchema(), sourceRecord.key(),
-                                                                    null, null);
+                            sourceRecord.sourceOffset(),
+                            sourceRecord.topic(),
+                            sourceRecord.keySchema(), sourceRecord.key(),
+                            null, null);
                     result.add(tombstoneRecord);
                 }
 
@@ -360,8 +367,8 @@ public class DynamoDBSourceTask extends SourceTask {
 
     private boolean isPreInitSyncRecord(Date arrivalTimestamp) {
         return arrivalTimestamp.toInstant()
-                               .plus(Duration.ofHours(1))
-                               .compareTo(sourceInfo.lastInitSyncStart) <= 0;
+                .plus(Duration.ofHours(1))
+                .compareTo(sourceInfo.lastInitSyncStart) <= 0;
     }
 
     private boolean recordIsInDangerZone(Date arrivalTimestamp) {
